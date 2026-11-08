@@ -1,0 +1,7 @@
+PySide6-Essentials>=6.8
+Pillow>=11
+numpy>=2.0
+Send2Trash>=1.8
+pillow-heif>=0.20   # optional: HEIC/HEIF (iPhone) photos
+onnxruntime-directml>=1.18   # AI modes: local inference on GPU (DirectML) or CPU
+av>=14                       # video decoding (PyAV, bundles FFmpeg - LGPL)
