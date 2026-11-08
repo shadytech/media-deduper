@@ -49,7 +49,7 @@ Blank or single-colour images are only matched as exact copies.
   With **Detect rotated copies** on, 4 rotations are embedded per image (about 4× AI work).
 * Thresholds were calibrated on real photos. Unrelated photos scored below about 0.83, and edited
   copies scored about 0.90 or higher.
-* Speed (RTX 5080): about 320 images/s on the GPU, about 50 images/s on the CPU only.
+* Speed (RTX 5080): about 320 images/s on the GPU, about 50 images/s on the CPU (Ryzen 7 9850X3D) only.
 
 ## Videos
 
