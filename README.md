@@ -1,4 +1,4 @@
-# Image & Video Duplicate Finder 2.0
+# Image & Video Duplicate Finder 2.1
 
 A Windows desktop app that scans folders of images **and videos** and finds duplicates
 using **file size + content hashing** (exact copies) and **local image recognition**
@@ -94,6 +94,7 @@ Image formats: JPEG, PNG, BMP, GIF, TIFF, WebP, ICO, HEIC/HEIF.
 .venv\Scripts\python.exe -m tests.test_engine
 .venv\Scripts\python.exe -m tests.test_gui
 .venv\Scripts\python.exe -m tests.test_trash_progress   # fake Recycle Bin; nothing is deleted
+.venv\Scripts\python.exe -m tests.test_eta     # time-remaining estimate
 .venv\Scripts\python.exe -m tests.test_ai      # uses Windows' built-in wallpapers
 .venv\Scripts\python.exe -m tests.test_video   # generates test videos from the wallpapers
 ```

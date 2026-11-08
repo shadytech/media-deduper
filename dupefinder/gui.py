@@ -9,7 +9,7 @@ import subprocess
 import sys
 
 from PySide6.QtCore import (QObject, QRunnable, QSettings, QSize, Qt, QThread, QThreadPool,
-                            QUrl, Signal)
+                            QTimer, QUrl, Signal)
 from PySide6.QtGui import QAction, QBrush, QColor, QDesktopServices, QFont, QGuiApplication, QImage, QPixmap
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog,
                                QGroupBox, QHBoxLayout, QHeaderView, QLabel, QListView, QListWidget,
@@ -23,6 +23,7 @@ from . import __version__
 from .engine import (DEFAULT_LEVEL, MEDIA_TYPES, SIMILARITY_LEVELS, ImageRecord, ScanCancelled,
                      ScanResult, scan)
 from .ai import ai_available
+from .eta import EtaEstimator, fmt_eta
 from .hashing import HEIF_SUPPORTED, _flatten_alpha, open_oriented
 from .video import fmt_duration, is_video, thumbnail_strip
 
@@ -198,6 +199,11 @@ class MainWindow(QMainWindow):
         self.records: dict[str, ImageRecord] = {}
         self.scan_thread: ScanThread | None = None
         self._file_op: FileOpThread | None = None
+        self.eta = EtaEstimator()
+        self._last_progress: tuple[str, int, int] | None = None
+        self._eta_timer = QTimer(self)
+        self._eta_timer.setInterval(1000)   # count the estimate down between progress updates
+        self._eta_timer.timeout.connect(self._show_progress_text)
         self.thumbs: dict[str, QPixmap] = {}
         self.pool = QThreadPool()
         self.pool.setMaxThreadCount(max(2, min(6, (os.cpu_count() or 2))))
@@ -451,38 +457,60 @@ class MainWindow(QMainWindow):
         self.scan_thread.failed.connect(self._on_failed)
         self.scan_thread.cancelled.connect(self._on_cancelled)
         self.scan_thread.finished.connect(self._scan_finished)
+        self.eta.reset()
+        self._last_progress = None
+        self._eta_timer.start()
         self.scan_thread.start()
 
     def cancel_scan(self):
         if self.scan_thread:
             self.scan_thread.cancel()
+            self._eta_timer.stop()
+            self._last_progress = None
             self.status_lbl.setText("Cancelling…")
             self.cancel_btn.setEnabled(False)
 
     def _on_progress(self, stage: str, done: int, total: int):
+        if self.scan_thread and self.scan_thread._cancel:
+            return  # keep showing "Cancelling…"
+        self.eta.update(stage, done, total)
+        self._last_progress = (stage, done, total)
         if total:
             self.progress.setRange(0, total)
             self.progress.setValue(done)
-            self.status_lbl.setText(f"{stage}: {done:,} / {total:,}")
         else:
             self.progress.setRange(0, 0)
+        self._show_progress_text()
+
+    def _show_progress_text(self):
+        if not self._last_progress:
+            return
+        stage, done, total = self._last_progress
+        if total:
+            self.status_lbl.setText(f"{stage}: {done:,} / {total:,} · {fmt_eta(self.eta.remaining())}")
+        else:
             self.status_lbl.setText(f"{stage}… {done:,}" if done else f"{stage}…")
 
     def _scan_finished(self):
+        self._eta_timer.stop()
+        self._last_progress = None
         self.scan_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
         self.progress.setRange(0, 1)
 
     def _on_cancelled(self):
+        self._last_progress = None
         self.progress.setValue(0)
         self.status_lbl.setText("Scan cancelled.")
 
     def _on_failed(self, msg: str):
+        self._last_progress = None
         self.progress.setValue(0)
         self.status_lbl.setText("Scan failed.")
         QMessageBox.critical(self, "Scan failed", msg)
 
     def _on_done(self, res: ScanResult):
+        self._last_progress = None
         self.progress.setRange(0, 1)
         self.progress.setValue(1)
         dupes = sum(len(g.files) - 1 for g in res.groups if g.kind == "duplicate")

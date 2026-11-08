@@ -600,7 +600,7 @@ def scan(folders: list[str], recursive: bool = True, level: str = DEFAULT_LEVEL,
         pending_ai: list[ImageRecord] = []
         pending_vai: list[ImageRecord] = []
         ai_batch: list[tuple[ImageRecord, np.ndarray]] = []
-        state = {"stage": "Analyzing files", "done": 0, "total": len(tasks)}
+        state = {"stage": "Analyzing files", "done": 0, "total": len(tasks), "last": 0.0}
 
         def get_embedder():
             nonlocal embedder
@@ -696,7 +696,9 @@ def scan(folders: list[str], recursive: bool = True, level: str = DEFAULT_LEVEL,
                             raise ScanCancelled
                         handle(fut.result())
                         state["done"] += 1
-                        if state["done"] % 5 == 0 or state["done"] == state["total"]:
+                        now = time.monotonic()
+                        if now - state["last"] >= 0.25 or state["done"] == state["total"]:
+                            state["last"] = now
                             progress(state["stage"], state["done"], state["total"])
                 flush_ai()
             finally:
