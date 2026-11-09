@@ -5,7 +5,11 @@ using **file size + content hashing** (exact copies) and **local image recogniti
 (perceptual hashing and an optional AI vision model). Nothing is uploaded anywhere;
 all processing happens on this PC.
 
-Settings and the scan cache are kept in `%LOCALAPPDATA%\ImageDupeFinder2\`.
+**New here? Read the [User Guide](docs/USER_GUIDE.md)** for installing, running and using the app,
+or [download the latest release](https://github.com/shadytech/media-deduper/releases/latest).
+
+The scan cache is kept in `%LOCALAPPDATA%\ImageDupeFinder2\`; settings are stored in the registry
+under `HKCU\Software\ImageDupeFinder\ImageDupeFinder2`.
 
 ## Setup (Windows 10/11)
 
