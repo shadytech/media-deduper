@@ -58,6 +58,14 @@ Use this if you want to change the code or run the latest unreleased version.
    Without the model the app still works, but the two **AI** match levels are greyed out.
 4. Double-click **run.bat**. The first run takes a few minutes while it creates a Python environment
    (`.venv`) and installs the requirements. Later runs open straight away.
+5. The first run also creates a **Media Deduper** shortcut, with the app's icon, in the same folder.
+   Use that from then on. To also put it on your Desktop or in the Start menu, run:
+
+   ```
+   powershell -ExecutionPolicy Bypass -File make_shortcut.ps1 -Desktop -StartMenu
+   ```
+
+   (A `.bat` file can't show its own icon in Windows, which is why the shortcut exists.)
 
 To build your own standalone `.exe` like the one in the releases, run
 `powershell -ExecutionPolicy Bypass -File build.ps1`. The result is in `dist\ImageDupeFinder\`.

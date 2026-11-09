@@ -11,6 +11,8 @@ if (-not (Test-Path .venv\Scripts\python.exe)) {
 .venv\Scripts\python.exe -m pip install --quiet pyinstaller
 .venv\Scripts\python.exe -m PyInstaller --noconfirm --clean --windowed `
     --name ImageDupeFinder `
+    --icon assets\app.ico `
+    --add-data "assets\app.ico;assets" `
     --collect-all pillow_heif `
     --collect-binaries onnxruntime `
     --collect-submodules av --collect-binaries av `

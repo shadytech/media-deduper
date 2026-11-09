@@ -22,6 +22,8 @@ under `HKCU\Software\ImageDupeFinder\ImageDupeFinder2`.
 ## Run
 
 * **From source:** double-click `run.bat` (creates `.venv` and installs the requirements on first run).
+  It also creates a **Media Deduper** shortcut with the app icon; `make_shortcut.ps1 -Desktop -StartMenu`
+  adds it to the Desktop and Start menu. The icon is drawn by `assets\make_icon.py`.
 * **Build a standalone exe:** `powershell -ExecutionPolicy Bypass -File build.ps1`, then run
   `dist\ImageDupeFinder\ImageDupeFinder.exe` (copy the whole folder anywhere).
 * **Headless / scripted:**

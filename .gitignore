@@ -7,3 +7,5 @@ __pycache__/
 models/*.onnx
 models/*.part
 *.sqlite3
+*.lnk
+assets/_preview.png

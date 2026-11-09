@@ -10,7 +10,8 @@ import sys
 
 from PySide6.QtCore import (QObject, QRunnable, QSettings, QSize, Qt, QThread, QThreadPool,
                             QTimer, QUrl, Signal)
-from PySide6.QtGui import QAction, QBrush, QColor, QDesktopServices, QFont, QGuiApplication, QImage, QPixmap
+from PySide6.QtGui import (QAction, QBrush, QColor, QDesktopServices, QFont, QGuiApplication, QIcon,
+                           QImage, QPixmap)
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog,
                                QGroupBox, QHBoxLayout, QHeaderView, QLabel, QListView, QListWidget,
                                QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar,
@@ -912,10 +913,34 @@ def show_in_explorer(path: str):
         QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(path)))
 
 
+def icon_path() -> str | None:
+    """assets/app.ico, from the packaged app or the source tree."""
+    roots = []
+    if getattr(sys, "frozen", False):
+        roots += [getattr(sys, "_MEIPASS", ""), os.path.dirname(sys.executable)]
+    roots.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    for r in roots:
+        p = os.path.join(r, "assets", "app.ico")
+        if os.path.isfile(p):
+            return p
+    return None
+
+
 def run() -> int:
+    if sys.platform == "win32":
+        # Own taskbar identity, so Windows shows this app's icon instead of grouping
+        # the window under python.exe when run from source.
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("MediaDeduper.App")
+        except Exception:
+            pass
     app = QApplication(sys.argv)
     app.setApplicationName("Image Duplicate Finder")
     app.setStyle("Fusion")
+    icon = icon_path()
+    if icon:
+        app.setWindowIcon(QIcon(icon))
     win = MainWindow()
     win.show()
     return app.exec()
