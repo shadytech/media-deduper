@@ -1,6 +1,6 @@
 """Local AI image embeddings (DINOv2-small via ONNX Runtime).
 
-The model turns each image into a 384-number vector describing its visual
+The model turns each image into a 768-number vector describing its visual
 content. Two copies of the same photo produce nearly the same vector even
 after cropping, rotation, filters or heavy re-compression, which plain
 perceptual hashes cannot handle.

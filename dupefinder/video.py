@@ -49,7 +49,9 @@ def _open(path: str):
     import av
 
     av.logging.set_level(av.logging.PANIC)  # keep FFmpeg quiet about damaged files
-    container = av.open(path)
+    # Local files only: whatever a file claims to be (e.g. a playlist that points
+    # somewhere else), FFmpeg may not open a network address while reading it.
+    container = av.open(path, options={"protocol_whitelist": "file"})
     if not container.streams.video:
         container.close()
         raise ValueError("no video stream")
@@ -142,7 +144,7 @@ def analyze_video(task: tuple) -> dict:
     """Worker entry point. task = (path, size, sha_mode, want_prop, want_timed).
 
     sha_mode: None, "full" or "partial"."""
-    from .hashing import _hashes, sha256_file
+    from .hashing import _hashes, sha256_file, transient
 
     path, size, sha_mode, want_prop, want_timed = task
     out: dict = {"path": path, "media": "video"}
@@ -153,6 +155,7 @@ def analyze_video(task: tuple) -> dict:
             out["sha256"] = partial_hash(path, size)
     except OSError as e:
         out["error"] = f"Read failed: {e}"
+        out["retry"] = True
     if not (want_prop or want_timed):
         return out
     try:
@@ -190,6 +193,8 @@ def analyze_video(task: tuple) -> dict:
         out["error"] = f"{type(e).__name__}: {e}"
         out["prop_done"] = bool(want_prop)
         out["timed_done"] = bool(want_timed)
+        if transient(e):
+            out["retry"] = True
     return out
 
 
@@ -210,7 +215,7 @@ def thumbnail_strip(path: str, size: int, n: int = 4) -> Image.Image:
     cw = (size - gap * (cols - 1)) // cols
     ar = frames[0].width / max(frames[0].height, 1)
     ch = max(1, min(int(cw / ar), (size - gap * (rows - 1)) // rows))
-    cw = int(ch * ar) if ch * ar < cw else cw
+    cw = max(1, int(ch * ar)) if ch * ar < cw else cw  # (very tall videos: never 0 wide)
     grid = Image.new("RGB", (cols * cw + gap * (cols - 1), rows * ch + gap * (rows - 1)), (20, 20, 20))
     for k, im in enumerate(frames):
         tile = im.resize((cw, ch))

@@ -181,7 +181,9 @@ Working with the results:
 - Hover over a file name to see its full path.
 - Drag the divider between the list and the preview to resize them, and drag column edges to widen columns.
 - Files that couldn't be read (damaged or unsupported) are listed under **Unreadable files** at the
-  end. They're never marked or removed.
+  end. They're never marked or removed. A file that was only locked by another program, or on a
+  drive that was offline, is tried again on the next scan.
+- Symbolic links to a file are skipped. A link is not a copy of the file it points to.
 
 ---
 
@@ -203,6 +205,10 @@ Files you **mark** (tick) are the ones that will be removed. Marked rows are hig
    | **Shortest path** | The file in the shallowest folder, e.g. `D:\Photos\a.jpg` over `D:\Photos\Old\Backup\a.jpg` |
 
 2. Click **Auto-mark duplicates**. In every group, one file is kept and the rest are marked.
+
+   One exception protects longer videos: a video is never auto-marked when it is longer than
+   every copy being kept. If the rule prefers a short clip (say, a 4K clip over the 720p video it
+   was cut from), the clip is kept **and** the full-length video stays unmarked.
 
 ### Mark by hand
 
@@ -232,6 +238,12 @@ If a file can't be removed (for example, it's open in another program), you'll b
 and why, and it stays in the list. The rest are still removed.
 
 > If you mark **every** copy in a group, the confirmation warns you, because no copy of those files would be left.
+
+> **When the Recycle Bin can't be used.** Windows has no Recycle Bin for network drives, USB sticks
+> and memory cards, and it can't recycle a file that is larger than the Recycle Bin's size limit
+> or on a drive where the Recycle Bin is turned off. Windows deletes such files permanently. The
+> confirmation tells you how many of the marked files this applies to before anything is removed.
+> To keep them recoverable, answer No and use **Move marked to folder…** instead.
 
 ### Move to a folder
 

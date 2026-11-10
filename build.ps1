@@ -1,9 +1,9 @@
 # Builds a standalone Windows app in dist\ImageDupeFinder\ImageDupeFinder.exe
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
-if (-not (Test-Path models\dinov2-small.onnx)) {
-    throw "AI model missing: download https://huggingface.co/onnx-community/dinov2-small/resolve/main/onnx/model.onnx to models\dinov2-small.onnx"
-}
+# Only a model file that passes its checksum goes into the app.
+& "$PSScriptRoot\get_model.ps1" -VerifyOnly
+if ($LASTEXITCODE -ne 0) { throw "AI model missing or not the expected file (see above)." }
 if (-not (Test-Path .venv\Scripts\python.exe)) {
     python -m venv .venv
     .venv\Scripts\python.exe -m pip install -r requirements.txt

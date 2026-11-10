@@ -17,6 +17,7 @@ under `HKCU\Software\ImageDupeFinder\ImageDupeFinder2`.
 2. Clone or download this repository.
 3. Download the AI model (about 84 MB; it is too large to keep in the repository):
    `powershell -ExecutionPolicy Bypass -File get_model.ps1`
+   The script downloads one pinned revision and checks its SHA-256 before installing it.
    Without it the app still works, but the AI match levels are unavailable.
 
 ## Run
@@ -101,6 +102,7 @@ Image formats: JPEG, PNG, BMP, GIF, TIFF, WebP, ICO, HEIC/HEIF.
 .venv\Scripts\python.exe -m tests.test_gui
 .venv\Scripts\python.exe -m tests.test_trash_progress   # fake Recycle Bin; nothing is deleted
 .venv\Scripts\python.exe -m tests.test_eta     # time-remaining estimate
+.venv\Scripts\python.exe -m tests.test_fixes   # regression tests: crashes, cancel, cache, safety checks
 .venv\Scripts\python.exe -m tests.test_ai      # uses Windows' built-in wallpapers
 .venv\Scripts\python.exe -m tests.test_video   # generates test videos from the wallpapers
 ```

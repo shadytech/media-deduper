@@ -26,6 +26,7 @@ from .engine import (DEFAULT_LEVEL, MEDIA_TYPES, SIMILARITY_LEVELS, ImageRecord,
 from .ai import ai_available
 from .eta import EtaEstimator, fmt_eta
 from .hashing import HEIF_SUPPORTED, _flatten_alpha, open_oriented
+from .recycle import not_recyclable
 from .video import fmt_duration, is_video, thumbnail_strip
 
 COL_FILE, COL_SIZE, COL_DIM, COL_DUR, COL_MATCH, COL_FOLDER = range(6)
@@ -45,6 +46,16 @@ KEEP_RULES = {
     "Newest file": lambda r: (-r.mtime_ns, -r.pixels, len(r.path)),
     "Shortest path": lambda r: (len(r.path), r.path),
 }
+
+
+def covers(kept: ImageRecord, other: ImageRecord) -> bool:
+    """Is removing `other` safe while `kept` stays?
+
+    Not when `other` is a longer video: a clip, even a sharper or larger one, does
+    not replace the video it was cut from. (Same tolerance as "same duration".)"""
+    if not (kept.is_video and other.is_video):
+        return True
+    return other.duration - kept.duration <= max(1.0, 0.03 * max(kept.duration, other.duration))
 
 
 def human_size(n: float) -> str:
@@ -122,6 +133,11 @@ class FileOpThread(QThread):
 
     def _move_one(self, p, ok, errors):
         try:
+            same = os.path.normcase(os.path.abspath(os.path.dirname(p))) == os.path.normcase(
+                os.path.abspath(self.dest))
+            if same:   # moving it "there" would only rename it with a _1 suffix
+                errors.append(f"{p}: already in that folder")
+                return
             base, ext = os.path.splitext(os.path.basename(p))
             target, n = os.path.join(self.dest, base + ext), 1
             while os.path.exists(target):
@@ -413,6 +429,8 @@ class MainWindow(QMainWindow):
         return [self.folder_list.item(i).text() for i in range(self.folder_list.count())]
 
     def _add_folder_path(self, path: str):
+        if not path:   # (normpath("") is ".", the app's own folder)
+            return
         path = os.path.normpath(path)
         if os.path.isdir(path) and path not in self._folders():
             self.folder_list.addItem(path)
@@ -433,6 +451,8 @@ class MainWindow(QMainWindow):
     def dropEvent(self, e):
         for url in e.mimeData().urls():
             p = url.toLocalFile()
+            if not p:
+                continue   # a web link dragged from a browser, not a file or folder
             self._add_folder_path(p if os.path.isdir(p) else os.path.dirname(p))
 
     # ----- scanning
@@ -445,6 +465,7 @@ class MainWindow(QMainWindow):
         self.preview.clear()
         self._shown_group = None
         self.records.clear()
+        self.thumbs.clear()   # files may have changed since the last scan
         self._update_summary()
         self.scan_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
@@ -613,8 +634,9 @@ class MainWindow(QMainWindow):
                 if c.checkState(0) == Qt.CheckState.Checked]
 
     def _update_summary(self):
-        marked = self._marked_items()
-        size = sum(self.records[c.data(0, PATH_ROLE)].size for c in marked)
+        # by path: a photo can be listed in two groups (a duplicate and a video's photos)
+        marked = {c.data(0, PATH_ROLE) for c in self._marked_items()}
+        size = sum(self.records[p].size for p in marked)
         ngroups = sum(1 for _ in self._groups())
         self.summary_lbl.setText(f"{ngroups:,} groups  |  {len(marked):,} marked "
                                  f"({human_size(size)})")
@@ -626,10 +648,16 @@ class MainWindow(QMainWindow):
         for g in self._groups():
             if g.data(0, KIND_ROLE) != "duplicate":
                 continue  # photo <-> video groups are informational only
-            kids = self._children(g)
-            keep = min(kids, key=lambda c: rule(self.records[c.data(0, PATH_ROLE)]))
-            for c in kids:
-                self._set_marked(c, c is not keep)
+            # Best file by the rule is kept. Each other file is marked only if a kept
+            # file can stand in for it, so a full-length video is never marked in
+            # favour of a clip of it, whatever the rule prefers.
+            kept: list[ImageRecord] = []
+            for c in sorted(self._children(g), key=lambda c: rule(self.records[c.data(0, PATH_ROLE)])):
+                rec = self.records[c.data(0, PATH_ROLE)]
+                replaceable = any(covers(k, rec) for k in kept)
+                self._set_marked(c, replaceable)
+                if not replaceable:
+                    kept.append(rec)
         self.tree.blockSignals(False)
         self._sync_preview_checks()
         self._update_summary()
@@ -770,21 +798,33 @@ class MainWindow(QMainWindow):
         menu.exec(self.tree.viewport().mapToGlobal(pos))
 
     # ----- file operations
-    def _confirm_marked(self, verb: str) -> list[str] | None:
+    def _confirm_marked(self, verb: str, recycle: bool = False) -> list[str] | None:
         marked = self._marked_items()
         if not marked:
             QMessageBox.information(self, "Nothing marked",
                                     "Tick the files you want to remove, or use Auto-mark duplicates.")
             return None
-        paths = [c.data(0, PATH_ROLE) for c in marked]
-        size = sum(self.records[p].size for p in paths)
+        # Each file once: a photo can be ticked in two groups (as a duplicate and
+        # under a video it appears in).
+        paths = list(dict.fromkeys(c.data(0, PATH_ROLE) for c in marked))
+        chosen = set(paths)
+        sizes = {p: self.records[p].size for p in paths}
+        # ...and "every copy" is judged by file, wherever it was ticked.
         whole = [g for g in self._groups() if g.data(0, KIND_ROLE) == "duplicate"
-                 and all(c.checkState(0) == Qt.CheckState.Checked for c in self._children(g))]
-        text = f"{verb} {len(paths):,} file(s), {human_size(size)}?"
+                 and all(c.data(0, PATH_ROLE) in chosen for c in self._children(g))]
+        text = f"{verb} {len(paths):,} file(s), {human_size(sum(sizes.values()))}?"
         icon = QMessageBox.Icon.Question
         if whole:
             text += (f"\n\nWarning: in {len(whole)} group(s) EVERY copy is marked, so no copy of "
-                     f"those images would be left behind.")
+                     f"those files would be left behind.")
+            icon = QMessageBox.Icon.Warning
+        lost = not_recyclable(paths, sizes) if recycle else []
+        if lost:
+            text += (f"\n\nWarning: {len(lost):,} of these files "
+                     f"({human_size(sum(sizes[p] for p in lost))}) can't go to the Recycle Bin. "
+                     f"They are on a network or removable drive, the Recycle Bin is turned off "
+                     f"for their drive, or they are larger than it allows. Windows will delete "
+                     f"them PERMANENTLY.\nFirst one: {lost[0]}")
             icon = QMessageBox.Icon.Warning
         box = QMessageBox(icon, "Confirm", text,
                           QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, self)
@@ -792,7 +832,7 @@ class MainWindow(QMainWindow):
         return paths if box.exec() == QMessageBox.StandardButton.Yes else None
 
     def trash_marked(self):
-        paths = self._confirm_marked("Send to the Recycle Bin")
+        paths = self._confirm_marked("Send to the Recycle Bin", recycle=True)
         if not paths:
             return
         self._run_file_op("trash", paths, None, "Sending to Recycle Bin", "sent to the Recycle Bin")
@@ -864,7 +904,10 @@ class MainWindow(QMainWindow):
             if g.data(0, PATH_ROLE) == "__unreadable__":
                 if g.childCount() == 0:
                     self.tree.takeTopLevelItem(i)
-            elif g.childCount() < 2:
+            elif g.childCount() < 2 or (
+                    # "photos from a video" means nothing once its video (first row) is gone
+                    g.data(0, KIND_ROLE) == "photo_in_video"
+                    and not self.records[g.child(0).data(0, PATH_ROLE)].is_video):
                 if g is self._shown_group:
                     self._shown_group = None
                 self.tree.takeTopLevelItem(i)
@@ -893,16 +936,20 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(self, "Export results", "duplicates.csv", "CSV (*.csv)")
         if not path:
             return
-        with open(path, "w", newline="", encoding="utf-8-sig") as f:
-            w = csv.writer(f)
-            w.writerow(["group", "group_type", "path", "media", "size_bytes", "width", "height",
-                        "duration_s", "match", "marked"])
-            for gi, g in enumerate(self._groups(), start=1):
-                for c in self._children(g):
-                    r = self.records[c.data(0, PATH_ROLE)]
-                    w.writerow([gi, g.data(0, KIND_ROLE), r.path, r.media, r.size, r.width,
-                                r.height, round(r.duration, 2), c.text(COL_MATCH),
-                                c.checkState(0) == Qt.CheckState.Checked])
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.writer(f)
+                w.writerow(["group", "group_type", "path", "media", "size_bytes", "width", "height",
+                            "duration_s", "match", "marked"])
+                for gi, g in enumerate(self._groups(), start=1):
+                    for c in self._children(g):
+                        r = self.records[c.data(0, PATH_ROLE)]
+                        w.writerow([gi, g.data(0, KIND_ROLE), r.path, r.media, r.size, r.width,
+                                    r.height, round(r.duration, 2), c.text(COL_MATCH),
+                                    c.checkState(0) == Qt.CheckState.Checked])
+        except OSError as e:   # e.g. the file is open in Excel, or the folder is read-only
+            QMessageBox.warning(self, "Export failed", f"Could not write {path}\n\n{e}")
+            return
         self.status_lbl.setText(f"Exported to {path}")
 
 

@@ -21,8 +21,12 @@ import warnings
 import numpy as np
 from PIL import Image, ImageOps
 
-# These are the user's own files; don't refuse very large photos/scans.
-Image.MAX_IMAGE_PIXELS = None
+# Largest image the app will decode. Pillow refuses a file (DecompressionBombError)
+# above twice this value, i.e. above one gigapixel. A crafted file can claim
+# enormous dimensions in a few bytes and exhaust memory when decoded, so there
+# has to be a ceiling; this one is far above any camera or scanner output.
+# Refused files are listed as unreadable and never touched.
+Image.MAX_IMAGE_PIXELS = 500_000_000
 warnings.simplefilter("ignore", Image.DecompressionBombWarning)
 
 try:  # Optional HEIC/HEIF (iPhone photos) support
@@ -54,6 +58,18 @@ _DCT32 = _dct_matrix(32)
 
 def _bits_to_int(bits: np.ndarray) -> int:
     return int.from_bytes(np.packbits(bits.astype(np.uint8).ravel()).tobytes(), "big")
+
+
+def transient(e: BaseException) -> bool:
+    """True when a failure may not happen next time: the file is locked by another
+    program, was moved, sits on a drive or cloud folder that is offline, or memory
+    ran out. False when the file itself can't be decoded. Transient failures are
+    not saved in the cache, so the file is tried again on the next scan."""
+    if isinstance(e, (PermissionError, FileNotFoundError, TimeoutError, ConnectionError, MemoryError)):
+        return True
+    # Plain OSError with an error number comes from the operating system (open/read);
+    # Pillow's own "cannot identify image" / "truncated" errors carry no number.
+    return type(e) is OSError and e.errno is not None
 
 
 def sha256_file(path: str, chunk: int = 1 << 20) -> str:
@@ -141,6 +157,7 @@ def analyze(task: tuple) -> dict:
             out["sha256"] = sha256_file(path)
         except OSError as e:
             out["error"] = f"Read failed: {e}"
+            out["retry"] = True
     if want_perc or want_ai:
         if want_perc:
             out["perc_done"] = True
@@ -163,4 +180,6 @@ def analyze(task: tuple) -> dict:
                 out["ai_pixels"] = prepare(rgb)
         except Exception as e:
             out["error"] = f"{type(e).__name__}: {e}"
+            if transient(e):
+                out["retry"] = True
     return out

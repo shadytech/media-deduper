@@ -21,14 +21,16 @@ from __future__ import annotations
 import os
 import sqlite3
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict, deque
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
 import numpy as np
 
 from . import video_match
+from .ai import EMBED_DIM, EMBED_VERSION, ai_available
 from .hashing import IMAGE_EXTS, analyze
 from .video import PARTIAL_HASH_MIN, VIDEO_EXTS, analyze_video, fmt_duration, timed_interval
 
@@ -150,13 +152,7 @@ def _u64(a) -> bytes:
     return np.asarray(a, dtype=np.uint64).tobytes()
 
 
-class HashCache:
-    """SQLite cache keyed on path, invalidated by size or modification time."""
-
-    def __init__(self, path: str | None):
-        self.db = sqlite3.connect(path or ":memory:")
-        self.db.executescript(
-            """CREATE TABLE IF NOT EXISTS files (
+_SCHEMA = """CREATE TABLE IF NOT EXISTS files (
                 path TEXT PRIMARY KEY, size INTEGER, mtime_ns INTEGER,
                 width INTEGER, height INTEGER, phash TEXT, dhash TEXT,
                 perc_done INTEGER, sha256 TEXT, error TEXT);
@@ -170,7 +166,55 @@ class HashCache:
                CREATE TABLE IF NOT EXISTS vai (
                 path TEXT PRIMARY KEY, size INTEGER, mtime_ns INTEGER,
                 model TEXT, times BLOB, vec BLOB);"""
-        )
+
+
+class HashCache:
+    """SQLite cache keyed on path, invalidated by size or modification time.
+
+    The cache only holds results that can be recomputed, so it must never stop
+    a scan: a damaged file is replaced, a locked or unwritable one is skipped
+    (the scan then runs without a saved cache)."""
+
+    def __init__(self, path: str | None):
+        self.path = path
+        self.dead = False   # writing failed (disk full, ...): stop saving, keep scanning
+        try:
+            self.db = self._open(path)
+        except sqlite3.OperationalError:   # locked by another copy of the app, or not writable
+            self.db = self._open(None)
+        except sqlite3.DatabaseError:      # not a database / malformed
+            self.reset()
+
+    @staticmethod
+    def _open(path: str | None) -> sqlite3.Connection:
+        db = sqlite3.connect(path or ":memory:")
+        try:
+            db.executescript(_SCHEMA)
+        except sqlite3.Error:
+            db.close()
+            raise
+        return db
+
+    def reset(self) -> None:
+        """Throw the cache file away and start an empty one (in memory if that fails)."""
+        db = getattr(self, "db", None)
+        if db is not None:
+            db.close()
+        try:
+            if self.path:
+                os.remove(self.path)
+            self.db = self._open(self.path)
+        except (OSError, sqlite3.Error):
+            self.db = self._open(None)
+
+    def _write(self, sql: str, rows: list) -> None:
+        if self.dead or not rows:
+            return
+        try:
+            self.db.executemany(sql, rows)
+            self.db.commit()
+        except sqlite3.Error:
+            self.dead = True
 
     def _select(self, sql: str, recs: list[ImageRecord]) -> dict[str, tuple]:
         found: dict[str, tuple] = {}
@@ -207,28 +251,88 @@ class HashCache:
                               None if r.prop_ph is None else _u64(r.prop_ph),
                               None if r.prop_dh is None else _u64(r.prop_dh),
                               None if r.prop_ok is None else r.prop_ok.astype(np.uint8).tobytes()))
-        self.db.executemany("INSERT OR REPLACE INTO files VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
-        if vrows:
-            self.db.executemany("INSERT OR REPLACE INTO vmeta VALUES (?,?,?,?,?,?,?,?,?,?)", vrows)
-        self.db.commit()
+        self._write("INSERT OR REPLACE INTO files VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
+        self._write("INSERT OR REPLACE INTO vmeta VALUES (?,?,?,?,?,?,?,?,?,?)", vrows)
 
     def store_ai(self, recs: Iterable[ImageRecord], model: str, views: int) -> None:
         rows = [(r.path, r.size, r.mtime_ns, model, views,
                  None if r.embedding is None else r.embedding.astype(np.float16).tobytes())
                 for r in recs]
-        self.db.executemany("INSERT OR REPLACE INTO ai VALUES (?,?,?,?,?,?)", rows)
-        self.db.commit()
+        self._write("INSERT OR REPLACE INTO ai VALUES (?,?,?,?,?,?)", rows)
 
     def store_vai(self, recs: Iterable[ImageRecord], model: str) -> None:
         rows = [(r.path, r.size, r.mtime_ns, model,
                  np.asarray(r.vtimes, np.float32).tobytes(),
                  np.clip(np.round(r.vemb * 127), -127, 127).astype(np.int8).tobytes())  # 8-bit
                 for r in recs]
-        self.db.executemany("INSERT OR REPLACE INTO vai VALUES (?,?,?,?,?,?)", rows)
-        self.db.commit()
+        self._write("INSERT OR REPLACE INTO vai VALUES (?,?,?,?,?,?)", rows)
 
     def close(self) -> None:
         self.db.close()
+
+
+# Reading cached rows back. Each returns False for a damaged row (wrong length or
+# type), which the caller then treats as "not cached" and analyses the file again.
+
+
+def _load_file_row(r: ImageRecord, row: tuple) -> tuple[bool, bool]:
+    """Fill r from its `files` row. Returns (perceptual hashes done, has a hash)."""
+    try:
+        _, _, _, w, h, ph, dh, perc_done, sha, err = row
+        phash = int(ph, 16) if ph else None
+        dhash = int(dh, 16) if dh else None
+        if not (sha is None or isinstance(sha, str)):
+            raise TypeError
+        w, h = int(w or 0), int(h or 0)
+    except (TypeError, ValueError):
+        return False, False
+    r.width, r.height, r.error = w, h, err
+    r.phash, r.dhash, r.sha256 = phash, dhash, sha
+    return bool(perc_done), sha is not None
+
+
+def _load_vmeta(r: ImageRecord, row: tuple) -> bool:
+    try:
+        _, _, _, dur, fps, codec, bitrate, pp, pd, pk = row
+        dur, fps, bitrate = float(dur or 0), float(fps or 0), int(bitrate or 0)
+        frames = None
+        if pp is not None:
+            frames = (np.frombuffer(pp, np.uint64), np.frombuffer(pd, np.uint64),
+                      np.frombuffer(pk, np.uint8).astype(bool))
+            if not len(frames[0]) == len(frames[1]) == len(frames[2]):
+                raise ValueError
+    except (TypeError, ValueError):
+        return False
+    r.duration, r.fps, r.codec, r.bitrate = dur, fps, codec or "", bitrate
+    if frames is not None:
+        r.prop_ph, r.prop_dh, r.prop_ok = frames
+    return True
+
+
+def _load_vai(r: ImageRecord, row: tuple) -> bool:
+    try:
+        times = np.frombuffer(row[4], np.float32).astype(np.float64)
+        vec = np.frombuffer(row[5], np.int8)
+        if len(vec) != len(times) * EMBED_DIM:
+            raise ValueError
+    except (TypeError, ValueError):
+        return False
+    r.vtimes = times
+    # (explicit width: a video with no usable frames is stored as zero rows)
+    r.vemb = vec.reshape(len(times), EMBED_DIM).astype(np.float32) / 127.0
+    return True
+
+
+def _load_ai(r: ImageRecord, row: tuple, views: int) -> bool:
+    try:
+        if row[5] is not None:
+            vec = np.frombuffer(row[5], np.float16)
+            if len(vec) != views * EMBED_DIM:
+                raise ValueError
+            r.embedding = vec.reshape(views, EMBED_DIM)
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 # --------------------------------------------------------------------------- scanning
@@ -245,6 +349,7 @@ def find_media(folders: list[str], recursive: bool, cancelled: Callable[[], bool
     out: list[ImageRecord] = []
     stack = [os.path.abspath(f) for f in folders]
     visited_dirs: set[str] = set()
+    last = 0.0
     while stack:
         if cancelled():
             raise ScanCancelled
@@ -259,6 +364,10 @@ def find_media(folders: list[str], recursive: bool, cancelled: Callable[[], bool
             continue
         for e in entries:
             try:
+                # A symbolic link is not a copy. Listing it next to its target would
+                # invite deleting the real file and keeping a link that points nowhere.
+                if e.is_symlink():
+                    continue
                 if e.is_dir(follow_symlinks=False):
                     if recursive and e.name.lower() not in SKIP_DIRS:
                         stack.append(e.path)
@@ -276,7 +385,11 @@ def find_media(folders: list[str], recursive: bool, cancelled: Callable[[], bool
                     out.append(ImageRecord(p, st.st_size, st.st_mtime_ns, media=kind))
             except OSError:
                 continue
-        progress("Finding files", len(out), 0)
+        now = time.monotonic()
+        if now - last >= 0.1:   # not once per folder: that floods the UI on big trees
+            last = now
+            progress("Finding files", len(out), 0)
+    progress("Finding files", len(out), 0)
     return out
 
 
@@ -481,27 +594,59 @@ def group_duplicates(records: list[ImageRecord], level: str | Level,
                 best_video[root] = gv
             for gi, s, t in lst:
                 if gi not in by_root[root] or s > by_root[root][gi][1]:
-                    by_root[root][gi] = (gi, s, t)
+                    by_root[root][gi] = (gi, s, t, gv)   # best match, and the copy it was found in
         for root, photos in by_root.items():
             gv = best_video[root]
             v = records[gv]
             own = {gi: (gi, s, t) for gi, s, t in hits.get(gv, [])}
             lst = sorted(photos.values(), key=lambda h: h[2])
-            files = [v] + [records[gi] for gi, _, _ in lst]
+            files = [v] + [records[h[0]] for h in lst]
             match = ["Video"]
-            for gi, s, t in lst:
+            for gi, s, t, src in lst:
                 if gi in own:  # timestamp within the video shown as the group's reference
                     _, s, t = own[gi]
                     match.append(f"Photo matches frame at {fmt_duration(t)} ({100 * s:.0f}%)")
                 else:
-                    src = next(records[g].name for g, l in hits.items()
-                               if uf.find(g) == root and any(x[0] == gi for x in l))
-                    match.append(f"Photo matches {src} at {fmt_duration(t)} ({100 * s:.0f}%)")
-            groups.append(DuplicateGroup(files, match, [100.0] + [100 * s for _, s, _ in lst],
+                    match.append(f"Photo matches {records[src].name} at {fmt_duration(t)} "
+                                 f"({100 * s:.0f}%)")
+            groups.append(DuplicateGroup(files, match, [100.0] + [100 * h[1] for h in lst],
                                          kind="photo_in_video"))
 
     groups.sort(key=lambda g: (g.kind != "duplicate", -g.reclaimable))
     return groups
+
+
+MAX_CRASHES_IN_A_ROW = 10   # worker crashes with nothing read in between: not one bad file
+
+
+def _stop_workers(ex: ProcessPoolExecutor) -> None:
+    """End a pool now, without waiting for workers that are still reading a file
+    (hashing a large video can take minutes). Workers only read, so this is safe."""
+    try:
+        stop = getattr(ex, "terminate_workers", None)   # Python 3.14+
+        if stop is not None:
+            stop()
+            return
+    except Exception:
+        pass
+    procs = list((getattr(ex, "_processes", None) or {}).values())
+    ex.shutdown(wait=False, cancel_futures=True)
+    for p in procs:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+
+
+def _crash_result(task: tuple, error: str = "Reading this file crashed the decoder, so it was skipped") -> dict:
+    """Result for a file whose worker process died (or failed outright) while reading it."""
+    kind, args = task
+    out = {"path": args[0], "error": error}
+    if kind == "video":
+        out.update(prop_done=bool(args[3]), timed_done=bool(args[4]))
+    else:
+        out.update(perc_done=bool(args[1]), ai_done=bool(len(args) > 3 and args[3]))
+    return out
 
 
 def scan(folders: list[str], recursive: bool = True, level: str = DEFAULT_LEVEL,
@@ -515,9 +660,7 @@ def scan(folders: list[str], recursive: bool = True, level: str = DEFAULT_LEVEL,
     need_perc_all = lvl.phash is not None
     need_ai = lvl.ai is not None
     views = 4 if ai_rotations else 1
-    EMBED_VERSION = ""
     if need_ai:
-        from .ai import EMBED_VERSION, ai_available
         ok, why = ai_available()
         if not ok:
             raise RuntimeError(f"AI mode unavailable: {why}")
@@ -534,11 +677,15 @@ def scan(folders: list[str], recursive: bool = True, level: str = DEFAULT_LEVEL,
     embedder = None
     cache = HashCache(default_cache_path() if cache_path == "default" else cache_path)
     try:
-        cached = cache.lookup(records)
-        cached_ai = cache.lookup_ai(records) if need_ai else {}
         vids = [r for r in records if r.is_video]
-        cached_vm = cache.lookup_vmeta(vids) if vids else {}
-        cached_vai = cache.lookup_vai(vids) if (vids and need_ai) else {}
+        try:
+            cached = cache.lookup(records)
+            cached_ai = cache.lookup_ai(records) if need_ai else {}
+            cached_vm = cache.lookup_vmeta(vids) if vids else {}
+            cached_vai = cache.lookup_vai(vids) if (vids and need_ai) else {}
+        except sqlite3.DatabaseError:   # damaged cache file: start it again, scan from scratch
+            cache.reset()
+            cached, cached_ai, cached_vm, cached_vai = {}, {}, {}, {}
         by_path = {r.path: r for r in records}
         tasks: list[tuple] = []
         perc_state: dict[str, bool] = {}
@@ -550,30 +697,15 @@ def scan(folders: list[str], recursive: bool = True, level: str = DEFAULT_LEVEL,
             row = cached.get(r.path)
             have_perc = have_sha = have_ai = False
             if fresh(row, r):
-                _, _, _, w, h, ph, dh, perc_done, sha, err = row
-                r.width, r.height, r.error = w or 0, h or 0, err
-                r.phash = int(ph, 16) if ph else None
-                r.dhash = int(dh, 16) if dh else None
-                r.sha256 = sha
-                have_perc, have_sha = bool(perc_done), sha is not None
+                have_perc, have_sha = _load_file_row(r, row)
             want_sha = size_count[r.size] > 1 and not have_sha
 
             if r.is_video:
                 vm = cached_vm.get(r.path)
-                if fresh(vm, r):
-                    _, _, _, r.duration, r.fps, r.codec, r.bitrate, pp, pd, pk = vm
-                    if pp is not None:
-                        r.prop_ph = np.frombuffer(pp, np.uint64)
-                        r.prop_dh = np.frombuffer(pd, np.uint64)
-                        r.prop_ok = np.frombuffer(pk, np.uint8).astype(bool)
-                else:
+                if not (fresh(vm, r) and _load_vmeta(r, vm)):
                     have_perc = False
                 va = cached_vai.get(r.path)
-                if fresh(va, r) and va[3] == VIDEO_AI_VERSION:
-                    have_ai = True
-                    r.vtimes = np.frombuffer(va[4], np.float32).astype(np.float64)
-                    r.vemb = np.frombuffer(va[5], np.int8).reshape(len(r.vtimes), -1).astype(
-                        np.float32) / 127.0
+                have_ai = fresh(va, r) and va[3] == VIDEO_AI_VERSION and _load_vai(r, va)
                 perc_state[r.path] = have_perc
                 sha_mode = None
                 if want_sha:
@@ -585,10 +717,8 @@ def scan(folders: list[str], recursive: bool = True, level: str = DEFAULT_LEVEL,
                 continue
 
             arow = cached_ai.get(r.path)
-            if (fresh(arow, r) and arow[3] == EMBED_VERSION and arow[4] == views):
-                have_ai = True
-                if arow[5] is not None:
-                    r.embedding = np.frombuffer(arow[5], dtype=np.float16).reshape(views, -1)
+            have_ai = (fresh(arow, r) and arow[3] == EMBED_VERSION and arow[4] == views
+                       and _load_ai(r, arow, views))
             perc_state[r.path] = have_perc
             want_perc = need_perc_all and not have_perc
             want_ai = need_ai and not have_ai
@@ -626,6 +756,9 @@ def scan(folders: list[str], recursive: bool = True, level: str = DEFAULT_LEVEL,
 
         def handle(res: dict):
             r = by_path[res["path"]]
+            # A failure that may not repeat (file locked, drive offline) is reported for
+            # this scan but kept out of the cache, so the next scan tries the file again.
+            keep = not res.get("retry")
             if "sha256" in res:
                 r.sha256 = res["sha256"]
             if "width" in res:
@@ -635,7 +768,7 @@ def scan(folders: list[str], recursive: bool = True, level: str = DEFAULT_LEVEL,
                     if k in res:
                         setattr(r, k, res[k])
                 if res.get("prop_done"):
-                    perc_state[r.path] = True
+                    perc_state[r.path] = keep
                     r.error = res.get("error")
                     ph = res.get("prop_phash")
                     if ph:
@@ -649,13 +782,14 @@ def scan(folders: list[str], recursive: bool = True, level: str = DEFAULT_LEVEL,
                     r.vtimes = np.asarray(res.get("timed_times", []), dtype=np.float64)
                     pix = res.get("timed_pixels")
                     r.vemb = (get_embedder().embed(pix) if pix is not None and len(pix)
-                              else np.zeros((0, 768), np.float32))
-                    pending_vai.append(r)
+                              else np.zeros((0, EMBED_DIM), np.float32))
+                    if keep:
+                        pending_vai.append(r)
                     if len(pending_vai) >= 20:
                         flush_ai()
             else:
                 if res.get("perc_done"):
-                    perc_state[r.path] = True
+                    perc_state[r.path] = keep
                     r.error = res.get("error")
                     r.phash, r.dhash = res.get("phash"), res.get("dhash")
                 elif "error" in res:
@@ -663,7 +797,7 @@ def scan(folders: list[str], recursive: bool = True, level: str = DEFAULT_LEVEL,
                 if res.get("ai_done"):
                     if "ai_pixels" in res:
                         ai_batch.append((r, res["ai_pixels"]))
-                    else:  # blank or unreadable: remember so we don't retry
+                    elif keep:  # blank or undecodable: remember so we don't retry
                         pending_ai.append(r)
                     if len(ai_batch) >= AI_BATCH:
                         flush_ai()
@@ -672,37 +806,84 @@ def scan(folders: list[str], recursive: bool = True, level: str = DEFAULT_LEVEL,
                 cache.store(pending_store)
                 pending_store.clear()
 
+        def finish(res: dict):
+            handle(res)
+            state["done"] += 1
+            now = time.monotonic()
+            if now - state["last"] >= 0.25 or state["done"] == state["total"]:
+                state["last"] = now
+                progress(state["stage"], state["done"], state["total"])
+
         def run_pool(task_list):
-            if not task_list:
-                return
+            """Run per-file tasks in worker processes, a bounded number in flight.
+
+            Cancel is checked twice a second, not only when a file finishes, and
+            stops the workers at once. If a worker process dies (a damaged file can
+            crash a decoder), the files that were in flight are run again one at a
+            time: the one that kills its worker is reported as unreadable and the
+            scan carries on with a new pool."""
+            queue = deque(task_list)
+            suspects: deque = deque()
             nworkers = workers or max(1, (os.cpu_count() or 2) - 1)
-            ex = ProcessPoolExecutor(max_workers=nworkers)
+            crashes = 0   # in a row, with no file read successfully in between
             try:
-                it = iter(task_list)
-                inflight = set()
-                window = nworkers * 3  # bounded: video results can be large
-                while True:
-                    while len(inflight) < window:
-                        t = next(it, None)
-                        if t is None:
-                            break
-                        fn = analyze_video if t[0] == "video" else analyze
-                        inflight.add(ex.submit(fn, t[1]))
-                    if not inflight:
-                        break
-                    finished, inflight = wait(inflight, return_when=FIRST_COMPLETED)
-                    for fut in finished:
-                        if cancelled():
-                            raise ScanCancelled
-                        handle(fut.result())
-                        state["done"] += 1
-                        now = time.monotonic()
-                        if now - state["last"] >= 0.25 or state["done"] == state["total"]:
-                            state["last"] = now
-                            progress(state["stage"], state["done"], state["total"])
+                while queue or suspects:
+                    solo = bool(suspects)
+                    source = suspects if solo else queue
+                    window = 1 if solo else nworkers * 3  # bounded: video results can be large
+                    ex = ProcessPoolExecutor(max_workers=1 if solo else nworkers)
+                    inflight: dict = {}
+                    broken = False
+                    try:
+                        while (source or inflight) and not broken:
+                            while source and len(inflight) < window:
+                                t = source.popleft()
+                                try:
+                                    fut = ex.submit(analyze_video if t[0] == "video" else analyze, t[1])
+                                except BrokenProcessPool:
+                                    source.appendleft(t)
+                                    broken = True
+                                    break
+                                inflight[fut] = t
+                            if broken:
+                                break
+                            finished, _ = wait(inflight, timeout=0.5, return_when=FIRST_COMPLETED)
+                            if cancelled():
+                                raise ScanCancelled
+                            for fut in finished:
+                                t = inflight.pop(fut)
+                                try:
+                                    res = fut.result()
+                                except BrokenProcessPool:
+                                    broken = True
+                                    if not solo:
+                                        suspects.append(t)
+                                        continue
+                                    res = _crash_result(t)   # it ran alone, so this file is the cause
+                                    crashes += 1
+                                    if crashes >= MAX_CRASHES_IN_A_ROW:
+                                        raise RuntimeError(
+                                            "The processes that read files keep crashing, so the scan "
+                                            f"was stopped. Last file: {t[1][0]}") from None
+                                except Exception as e:   # a failure the worker didn't catch itself
+                                    res = _crash_result(t, f"{type(e).__name__}: {e}")
+                                else:
+                                    crashes = 0
+                                finish(res)
+                        if broken:   # the pool is gone: keep what finished, re-run the rest alone
+                            for fut, t in inflight.items():
+                                if fut.done() and not fut.cancelled() and fut.exception() is None:
+                                    finish(fut.result())
+                                else:
+                                    suspects.append(t)
+                            inflight.clear()
+                    finally:
+                        if broken or inflight:   # crash, cancel or error: don't wait for workers
+                            _stop_workers(ex)
+                        else:
+                            ex.shutdown(wait=False)
                 flush_ai()
             finally:
-                ex.shutdown(wait=False, cancel_futures=True)
                 if pending_store:
                     cache.store(pending_store)
                     pending_store.clear()
@@ -710,13 +891,20 @@ def scan(folders: list[str], recursive: bool = True, level: str = DEFAULT_LEVEL,
         progress(state["stage"], 0, state["total"])
         run_pool(tasks)
 
-        # Full SHA-256 for big videos whose size + partial hash collide.
-        partial = defaultdict(list)
+        # Full SHA-256 for big videos that may still be exact copies: their quick
+        # partial hashes collide, or a same-size file already has a full hash (kept
+        # from an earlier scan), which a partial hash can't be compared with.
+        by_size = defaultdict(list)
         for r in records:
-            if r.sha256 and r.sha256.startswith("p:"):
-                partial[(r.size, r.sha256)].append(r)
-        full_tasks = [("video", (r.path, r.size, "full", False, False))
-                      for grp in partial.values() if len(grp) > 1 for r in grp]
+            if r.sha256:
+                by_size[r.size].append(r)
+        full_tasks = []
+        for grp in by_size.values():
+            part = [r for r in grp if r.sha256.startswith("p:")]
+            mixed = len(part) < len(grp)
+            seen_hash = Counter(r.sha256 for r in part)
+            full_tasks += [("video", (r.path, r.size, "full", False, False))
+                           for r in part if mixed or seen_hash[r.sha256] > 1]
         if full_tasks:
             state.update(stage="Verifying exact video copies", done=0, total=len(full_tasks))
             run_pool(full_tasks)
